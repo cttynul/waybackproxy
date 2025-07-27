@@ -6,15 +6,19 @@ WaybackProxy is a retro-friendly HTTP proxy which retrieves pages from the [Inte
 
 ## Setup
 
+Python 3.5 or newer is required.
+
 1. Edit `config.json` to your liking
-2. Start `waybackproxy.py` (Python 3 is required)
-3. Set up your retro browser:
+2. Optionally exclude domains from being proxied by adding them to `whitelist.txt`
+3. Install dependencies: `pip install --user -r requirements.txt`
+4. Start `waybackproxy.py`
+5. Set up your retro browser:
 	* If your browser supports proxy auto-configuration, set the auto-configuration URL to `http://ip:port/proxy.pac` where `ip` is the IP of the system running WaybackProxy and `port` is the proxy's port (8888 by default).
 	* If proxy auto-configuration is not supported or fails to work, set the browser to use an HTTP proxy at that IP and port instead.
 	* Transparent proxying is also supported for advanced users, with no configuration to WaybackProxy itself required.
 		* The easiest way to set up a transparent WaybackProxy is to run it on port 80 ([this cannot be done on Linux without security implications](https://unix.stackexchange.com/questions/87348/capabilities-for-a-script-on-linux)\), set up a fake DNS server - such as `dnsmasq -A "/#/ip"` where `ip` is the IP of the system running WaybackProxy - to redirect all requests to the proxy, and point client machines at that DNS server.
-4. Try it out! You can edit most settings that are in `config.json` by browsing to http://web.archive.org while on the proxy, although you must edit `config.json` to make them permanent.
-5. Press Ctrl+C to stop the proxy
+6. Try it out! You can edit most settings that are in `config.json` by browsing to http://web.archive.org while on the proxy, although you must edit `config.json` to make them permanent.
+7. Press Ctrl+C to stop the proxy
 
 ## Docker Container
 
@@ -79,5 +83,5 @@ docker run -d -e DATE=20011025 -p 8888:8888 waybackproxy
 ## Other links
 
 * [Donate to the Internet Archive](https://archive.org/donate/), they need your help to keep the Wayback Machine and its petabytes upon petabytes of data available to everyone for free with no ads.
-* [Check out 86Box](https://86box.github.io/), the emulator I use for testing WaybackProxy on older browsers.
-* [WaybackProxy](https://hub.docker.com/r/cttynul/waybackproxy) on Docker Hub
+* [Check out 86Box](https://86box.net), the emulator I use for testing WaybackProxy on older browsers.
+* [WaybackProxy container](https://hub.docker.com/r/cttynul/waybackproxy) on Docker Hub.

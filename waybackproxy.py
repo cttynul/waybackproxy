@@ -1,20 +1,110 @@
 #!/usr/bin/env python3
-import base64, datetime, json, lrudict, re, socket, socketserver, string, sys, threading, traceback, urllib.request, urllib.error, urllib.parse
+import base64, collections, datetime, json, re, socket, socketserver, string, sys, threading, time, traceback, urllib.parse
+try:
+	import urllib3
+except ImportError:
+	print('WaybackProxy now requires urllib3 to be installed. Follow setup step 3 on the readme to fix this.')
+	sys.exit(1)
 from config_handler import *
 
 class ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 	"""TCPServer with ThreadingMixIn added."""
 	pass
 
+# http://code.activestate.com/recipes/580644-lru-dictionary/
+class LRUDict(collections.OrderedDict):
+	'''An dict that can discard least-recently-used items, either by maximum capacity
+	or by time to live.
+	An item's ttl is refreshed (aka the item is considered "used") by direct access
+	via [] or get() only, not via iterating over the whole collection with items()
+	for example.
+	Expired entries only get purged after insertions or changes. Either call purge()
+	manually or check an item's ttl with ttl() if that's unacceptable.
+	'''
+	def __init__(self, *args, maxduration=None, maxsize=128, **kwargs):
+		'''Same arguments as OrderedDict with these 2 additions:
+		maxduration: number of seconds entries are kept. 0 or None means no timelimit.
+		maxsize: maximum number of entries being kept.'''
+		super().__init__(*args, **kwargs)
+		self.maxduration = maxduration
+		self.maxsize = maxsize
+		self.purge()
+
+	def purge(self):
+		'''Removes expired or overflowing entries.'''
+		if self.maxsize:
+			# pop until maximum capacity is reached
+			overflowing = max(0, len(self) - self.maxsize)
+			for _ in range(overflowing):
+				self.popitem(last=False)
+		if self.maxduration:
+			# expiration limit
+			limit = time.time() - self.maxduration
+			# as long as there are still items in the dictionary
+			while self:
+				# look at the oldest (front)
+				_, lru = next(iter(super().values()))
+				# if it is within the timelimit, we're fine
+				if lru > limit:
+					break
+				# otherwise continue to pop the front
+				self.popitem(last=False)
+
+	def __getitem__(self, key):
+		# retrieve item
+		value = super().__getitem__(key)[0]
+		# update lru time
+		super().__setitem__(key, (value, time.time()))
+		self.move_to_end(key)
+		return value
+
+	def get(self, key, default=None):
+		try:
+			return self[key]
+		except KeyError:
+			return default
+
+	def ttl(self, key):
+		'''Returns the number of seconds this item will live.
+		The item might still be deleted if maxsize is reached.
+		The time to live can be negative, as for expired items
+		that have not been purged yet.'''
+		if self.maxduration:
+			lru = super().__getitem__(key)[1]
+			return self.maxduration - (time.time() - lru)
+
+	def __setitem__(self, key, value):
+		super().__setitem__(key, (value, time.time()))
+		self.purge()
+		
+	def items(self):
+		# remove ttl from values
+		return ((k, v) for k, (v, _) in super().items())
+	
+	def values(self):
+		# remove ttl from values
+		return (v for v, _ in super().values())
+
 class SharedState:
 	"""Class for storing shared state across instances of Handler."""
 
 	def __init__(self):
+		# Create urllib3 connection pool.
+		self.http = urllib3.PoolManager(maxsize=4, block=True)
+		urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 		# Create internal LRU dictionary for preserving URLs on redirect.
-		self.date_cache = lrudict.LRUDict(maxduration=86400, maxsize=1024)
+		self.date_cache = LRUDict(maxduration=86400, maxsize=1024)
 
 		# Create internal LRU dictionary for date availability.
-		self.availability_cache = lrudict.LRUDict(maxduration=86400, maxsize=1024) if WAYBACK_API else None
+		self.availability_cache = LRUDict(maxduration=86400, maxsize=1024)
+
+		# Read domain whitelist file.
+		try:
+			with open('whitelist.txt', 'r') as f:
+				self.whitelist = f.read().splitlines()
+		except:
+			self.whitelist = []
 
 shared_state = SharedState()
 
@@ -33,15 +123,15 @@ class Handler(socketserver.BaseRequestHandler):
 
 		# readline is pretty convenient
 		f = self.request.makefile()
-		
+
 		# read request line
 		reqline = line = f.readline()
 		split = line.rstrip().split(' ')
-		http_version = len(split) > 2 and split[2] or 'HTTP/0.9'
+		http_version = len(split) > 2 and split[2].upper() or 'HTTP/0.9'
 
-		if len(split) < 2 or split[0] != 'GET':
+		if len(split) < 2 or split[0].upper() != 'GET':
 			# only GET is implemented
-			return self.send_error_page(http_version, 501, 'Not Implemented')
+			return self.send_error_page(http_version, 501, 'Not Implemented', extra=split[0])
 
 		# read out the headers
 		request_host = None
@@ -104,7 +194,7 @@ class Handler(socketserver.BaseRequestHandler):
 				pac += '''\r\n'''
 				pac += '''function FindProxyForURL(url, host)\r\n'''
 				pac += '''{\r\n'''
-				if self.shared_state.availability_cache == None:
+				if not WAYBACK_API:
 					pac += '''	if (shExpMatch(url, "http://web.archive.org/web/*") && !shExpMatch(url, "http://web.archive.org/web/??????????????if_/*"))\r\n'''
 					pac += '''	{\r\n'''
 					pac += '''		return "DIRECT";\r\n'''
@@ -113,6 +203,8 @@ class Handler(socketserver.BaseRequestHandler):
 				pac += '''}\r\n'''
 				self.request.sendall(pac.encode('ascii', 'ignore'))
 				return
+			elif hostname in self.shared_state.whitelist:
+				_print('[>] [byp]', archived_url)
 			elif hostname == 'web.archive.org':
 				if path[:5] != '/web/':
 					# Launch settings if enabled.
@@ -137,89 +229,98 @@ class Handler(socketserver.BaseRequestHandler):
 				# Get from the Wayback Machine.
 				_print('[>]', archived_url)
 
-				request_url = 'http://web.archive.org/web/{0}if_/{1}'.format(effective_date, archived_url)
+				request_url = 'https://web.archive.org/web/{0}if_/{1}'.format(effective_date, archived_url)
 
 			# Check Wayback Machine Availability API where applicable, to avoid archived 404 pages and other site errors.
-			if self.shared_state.availability_cache != None:
-				# Are we requesting from the Wayback Machine?
-				split = request_url.split('/')
+			split = request_url.split('/')
+			if split[2] == 'web.archive.org':
+				# Remove extraneous :80 from URL.
+				if ':' in split[5]:
+					if split[7][-3:] == ':80':
+						split[7] = split[7][:-3]
+				elif split[5][-3:] == ':80':
+					split[5] = split[5][:-3]
 
-				# If so, get the closest available date from the API.
-				if split[2] == 'web.archive.org':
-					# Remove extraneous :80 from URL.
-					if ':' in split[5]:
-						if split[7][-3:] == ':80':
-							split[7] = split[7][:-3]
-					elif split[5][-3:] == ':80':
-						split[5] = split[5][:-3]
+				# Check availability LRU cache.
+				availability_url = '/'.join(split[5:])
+				new_url = self.shared_state.availability_cache.get(availability_url, None)
+				if new_url:
+					# In cache => replace URL immediately.
+					request_url = new_url
+				elif WAYBACK_API:
+					# Not in cache => contact API.
+					try:
+						availability_endpoint = 'https://archive.org/wayback/available?url=' + urllib.parse.quote_plus(availability_url) + '&timestamp=' + effective_date[:14]
+						availability = json.loads(self.shared_state.http.request('GET', availability_endpoint, timeout=10, retries=1).data)
+						closest = availability.get('archived_snapshots', {}).get('closest', {})
+						new_date = closest.get('timestamp', None)
+					except:
+						_print('[!] Failed to fetch Wayback availability data')
+						new_date = None
 
-					# Check availability LRU cache.
-					availability_url = '/'.join(split[5:])
-					new_url = self.shared_state.availability_cache.get(availability_url, None)
-					if new_url:
-						# In cache => replace URL immediately.
-						request_url = new_url
-					else:
-						# Not in cache => contact API.
-						try:
-							availability = json.loads(urllib.request.urlopen('https://archive.org/wayback/available?url=' + urllib.parse.quote_plus(availability_url) + '&timestamp=' + effective_date[:14], timeout=10).read())
-							closest = availability.get('archived_snapshots', {}).get('closest', {})
-							new_date = closest.get('timestamp', None)
-						except:
-							_print('[!] Failed to fetch Wayback availability data')
-							new_date = None
+					if new_date and new_date != effective_date[:14]:
+						# Returned date is different.
+						new_url = closest['url']
 
-						if new_date and new_date != effective_date[:14]:
-							# Returned date is different.
-							new_url = closest['url']
+						# Add asset tag to the date.
+						split = new_url.split('/')
+						if len(effective_date) > 14:
+							split[4] += effective_date[14:]
+						else:
+							split[4] += 'if_'
+						new_url = '/'.join(split)
 
-							# Add asset tag to the date.
-							split = new_url.split('/')
-							if len(effective_date) > 14:
-								split[4] += effective_date[14:]
-							else:
-								split[4] += 'if_'
-							new_url = '/'.join(split)
-
-							# Replace URL and add it to the availability cache.
-							request_url = self.shared_state.availability_cache[availability_url] = new_url
+						# Replace URL and add it to the availability cache.
+						request_url = self.shared_state.availability_cache[availability_url] = new_url
 
 			# Start fetching the URL.
-			conn = urllib.request.urlopen(request_url)
-		except urllib.error.HTTPError as e:
-			# An HTTP error has occurred.
-			if e.code in (403, 404, 412): # not found or tolerance exceeded
-				# Heuristically determine the static URL for some redirect scripts.
-				parsed = urllib.parse.urlparse(archived_url)
-				match = re.search('''(?:^|&)[^=]+=((?:https?(?:%3A|:)(?:%2F|/)|www[0-9]*\\.[^/%]+)?(?:%2F|/)[^&]+)''', parsed.query, re.I) # URL in query parameters
-				if not match:
-					full_path = parsed.path
-					if parsed.query:
-						full_path += '?' + parsed.query
-					match = re.search('''((?:https?(?:%3A|:)(?:%2F|/)|www[0-9]*\\.[^/%]+)(?:%2F|/).+)''', full_path, re.I) # URL in path or full query
-				if match: # found URL
-					# Decode and sanitize the URL.
-					new_url = self.sanitize_redirect(urllib.parse.unquote_plus(match.group(1)))
+			retry = urllib3.util.retry.Retry(total=10, connect=10, read=5, redirect=0, backoff_factor=1)
+			while True:
+				conn = self.shared_state.http.urlopen('GET', request_url, redirect=False, retries=retry, preload_content=False)
 
-					# Redirect client to the URL.
-					_print('[r] [g]', new_url)
-					return self.send_redirect_page(http_version, new_url)
-			elif e.code in (301, 302): # urllib-generated error about an infinite redirect loop
-				_print('[!] Infinite redirect loop')
-				return self.send_error_page(http_version, 508, 'Infinite Redirect Loop')
+				# Check for redirects.
+				destination = conn.get_redirect_location()
+				if destination:
+					self.drain_conn(conn)
+					conn.release_conn()
 
-			if e.code != 412: # tolerance exceeded has its own error message above
-				_print('[!]', e.code, e.reason)
+					# Check if the redirect goes to a different Wayback URL.
+					match = re.search('''(?:(?:https?:)?//web.archive.org)?/web/([^/]+/)(.+)''', destination)
+					if match:
+						archived_dest = self.sanitize_redirect(match.group(2))
 
-			# If the memento Link header is present, this is a website error
-			# instead of a Wayback error. Pass it along if that's the case.
-			if 'Link' in e.headers:
-				conn = e
-			else:
-				return self.send_error_page(http_version, e.code, e.reason)
-		except socket.timeout as e:
-			# A timeout has occurred.
-			_print('[!] Fetch timeout')
+						# Check if the archived URL is different.
+						if archived_dest != archived_url:
+							# Remove extraneous :80 from URL.
+							archived_dest = re.sub('''^([^/]*//[^/]+):80''', '\\1', archived_dest)
+
+							# Add destination to availability cache and redirect the client.
+							_print('[r]', archived_dest)
+							self.shared_state.availability_cache[archived_dest] = 'http://web.archive.org/web/' + match.group(1) + archived_dest
+							return self.send_redirect_page(http_version, archived_dest, conn.status)
+
+					# Not an archived URL or same URL, redirect ourselves.
+					request_url = destination
+					continue
+
+				# Wayback will add its JavaScript to anything it thinks is JavaScript.
+				# If this is detected, redirect ourselves through the raw asset interface.
+				content_type = conn.headers.get('Content-Type')
+				guessed_content_type = conn.headers.get('X-Archive-Guessed-Content-Type')
+				if not guessed_content_type:
+					guessed_content_type = content_type
+				if 'javascript' in guessed_content_type:
+					match = re.match('''(https?://web\\.archive\\.org/web/[0-9]+)([^/]*)(.+)''', request_url)
+					if match and match.group(2) != 'im_':
+						self.drain_conn(conn)
+						conn.release_conn()
+						request_url = match.group(1) + 'im_' + match.group(3)
+						continue
+
+				# This request can proceed.
+				break
+		except urllib3.exceptions.MaxRetryError as e:
+			_print('[!] Fetch retries exceeded:', e.reason)
 			return self.send_error_page(http_version, 504, 'Gateway Timeout')
 		except:
 			# Some other fetch exception has occurred.
@@ -227,8 +328,29 @@ class Handler(socketserver.BaseRequestHandler):
 			traceback.print_exc()
 			return self.send_error_page(http_version, 502, 'Bad Gateway')
 
-		# Get content type.
-		content_type = conn.info().get('Content-Type')
+		# Check for HTTP errors.
+		if conn.status != 200:
+			if conn.status in (403, 404): # not found
+				if self.guess_and_send_redirect(http_version, archived_url):
+					self.drain_conn(conn)
+					conn.release_conn()
+					return
+			#elif conn.status in (301, 302): # redirect loop detection currently unused
+			#	self.drain_conn(conn)
+			#	conn.release_conn()
+			#	return self.send_error_page(http_version, 508, 'Infinite Redirect Loop')
+
+			if conn.status != 412: # tolerance exceeded has its own error message above
+				_print('[!]', conn.status, conn.reason)
+
+			# If the memento Link header is present, this is a website error
+			# instead of a Wayback error. Pass it along if that's the case.
+			if 'Link' not in conn.headers:
+				self.drain_conn(conn)
+				conn.release_conn()
+				return self.send_error_page(http_version, conn.status, conn.reason)
+
+		# Adjust content type.
 		if content_type == None:
 			content_type = 'text/html'
 		elif not CONTENT_TYPE_ENCODING:
@@ -244,32 +366,34 @@ class Handler(socketserver.BaseRequestHandler):
 
 		# Check content type to determine if this is HTML we need to patch.
 		# Wayback will add its HTML to anything it thinks is HTML.
-		guessed_content_type = conn.info().get('X-Archive-Guessed-Content-Type')
-		if not guessed_content_type:
-			guessed_content_type = content_type
 		if 'text/html' in guessed_content_type:
 			# Some dynamically-generated links may end up pointing to
 			# web.archive.org. Correct that by redirecting the Wayback
 			# portion of the URL away if it ends up being HTML consumed
 			# through the QUICK_IMAGES interface.
 			if hostname == 'web.archive.org':
-				conn.close()
+				self.drain_conn(conn)
+				conn.release_conn()
 				archived_url = '/'.join(request_url.split('/')[5:])
 				_print('[r] [QI]', archived_url)
 				return self.send_redirect_page(http_version, archived_url, 301)
 
 			# Check if the date is within tolerance.
 			if DATE_TOLERANCE != None:
-				match = re.search('''//web\\.archive\\.org/web/([0-9]+)''', conn.geturl())
+				match = re.search('''(?://web\\.archive\\.org|^)/web/([0-9]+)''', conn.geturl() or '')
 				if match:
 					requested_date = match.group(1)
 					if self.wayback_to_datetime(requested_date) > self.wayback_to_datetime(original_date) + datetime.timedelta(int(DATE_TOLERANCE)):
+						self.drain_conn(conn)
+						conn.release_conn()
 						_print('[!]', requested_date, 'is outside the configured tolerance of', DATE_TOLERANCE, 'days')
-						conn.close()
-						return self.send_error_page(http_version, 412, 'Snapshot ' + requested_date + ' not available')
+						if not self.guess_and_send_redirect(http_version, archived_url):
+							self.send_error_page(http_version, 412, 'Snapshot ' + requested_date + ' not available')
+						return
 
 			# Consume all data.
 			data = conn.read()
+			conn.release_conn()
 
 			# Patch the page.
 			if mode == 0: # Wayback Machine
@@ -292,20 +416,20 @@ class Handler(socketserver.BaseRequestHandler):
 
 						# Start fetching the URL.
 						_print('[f]', archived_url)
-						try:
-							conn = urllib.request.urlopen(request_url)
-						except urllib.error.HTTPError as e:
-							_print('[!]', e.code, e.reason)
+						conn = self.shared_state.http.urlopen('GET', request_url, retries=retry, preload_content=False)
+
+						if conn.status != 200:
+							_print('[!]', conn.status, conn.reason)
 
 							# If the memento Link header is present, this is a website error
 							# instead of a Wayback error. Pass it along if that's the case.
-							if 'Link' in e.headers:
-								conn = e
-							else:
-								return self.send_error_page(http_version, e.code, e.reason)
+							if 'Link' not in conn.headers:
+								self.drain_conn(conn)
+								conn.release_conn()
+								return self.send_error_page(http_version, conn.status, conn.reason)
 
 						# Identify content type so we don't modify non-HTML content.
-						content_type = conn.info().get('Content-Type')
+						content_type = conn.headers.get('Content-Type')
 						if not CONTENT_TYPE_ENCODING:
 							idx = content_type.find(';')
 							if idx > -1:
@@ -313,6 +437,7 @@ class Handler(socketserver.BaseRequestHandler):
 						if 'text/html' in content_type:
 							# Consume all data and proceed with patching the page.
 							data = conn.read()
+							conn.release_conn()
 						else:
 							# Pass non-HTML data through.
 							return self.send_passthrough(conn, http_version, content_type, request_url)
@@ -339,9 +464,9 @@ class Handler(socketserver.BaseRequestHandler):
 						return self.send_redirect_page(http_version, archived_url, redirect_code)
 
 				# Remove pre-toolbar scripts and CSS.
-				data = re.sub(b'''<script src="//archive\\.org/.*<!-- End Wayback Rewrite JS Include -->\\r?\\n''', b'', data, flags=re.S)
+				data = re.sub(b'''(?:<!-- is_embed=True -->\\r?\\n?)?<script (?:type="text/javascript" )?src="[^"]*/_static/js/.*<!-- End Wayback Rewrite JS Include -->\\r?\\n''', b'', data, count=1, flags=re.S)
 				# Remove toolbar. The if_ asset tag serves no toolbar, but we remove it just in case.
-				data = re.sub(b'''<!-- BEGIN WAYBACK TOOLBAR INSERT -->.*<!-- END WAYBACK TOOLBAR INSERT -->''', b'', data, flags=re.S)
+				data = re.sub(b'''<!-- BEGIN WAYBACK TOOLBAR INSERT -->.*<!-- END WAYBACK TOOLBAR INSERT -->''', b'', data, count=1, flags=re.S)
 				# Remove comments on footer.
 				data = re.sub(b'''<!--\\r?\\n     FILE ARCHIVED .*$''', b'', data, flags=re.S)
 				# Fix base tag.
@@ -361,12 +486,17 @@ class Handler(socketserver.BaseRequestHandler):
 					# username:password, which taints less but is not supported
 					# by all browsers - IE notably kills the whole page if it
 					# sees an iframe pointing to an invalid URL.
-					data = re.sub(b'(?:(?:https?:)?//web.archive.org)?/web/([0-9]+)([a-z]+_)/([^:/]+://)',
-						QUICK_IMAGES == 2 and b'\\3\\1:\\2@' or b'http://web.archive.org/web/\\1\\2/\\3', data)
-					def strip_https(match): # convert secure non-asset URLs to regular HTTP
-						first_component = match.group(1)
-						return first_component == b'https:' and b'http:' or first_component
-					data = re.sub(b'(?:(?:https?:)?//web.archive.org)?/web/[^/]+/([^/]+)', strip_https, data)
+					def filter_asset(match):
+						if match.group(2) in (None, b'if_', b'fw_'): # non-asset URL
+							return match.group(3) == b'https://' and b'http://' or match.group(3) # convert secure non-asset URLs to regular HTTP
+						asset_type = match.group(2)
+						if asset_type == b'js_': # cut down on the JavaScript detector's second request
+							asset_type = b'im_'
+						if QUICK_IMAGES == 2:
+							return b'http://' + match.group(1) + b':' + asset_type + b'@'
+						else:
+							return b'http://web.archive.org/web/' + match.group(1) + asset_type + b'/' + match.group(3)
+					data = re.sub(b'(?:(?:https?:)?//web.archive.org)?/web/([0-9]+)([a-z]+_)?/([^:/]+:(?://)?)', filter_asset, data)
 				else:
 					# Remove asset URLs while simultaneously adding them to the date LRU cache
 					# with their respective date and converting secure URLs to regular HTTP.
@@ -374,7 +504,7 @@ class Handler(socketserver.BaseRequestHandler):
 						orig_url = match.group(2)
 						if orig_url[:8] == b'https://':
 							orig_url = b'http://' + orig_url[8:]
-						self.shared_state.date_cache[str(effective_date) + '\x00' + orig_url.decode('ascii', 'ignore')] = match.group(1).decode('ascii', 'ignore')
+						self.shared_state.date_cache[str(effective_date) + '\x00' + orig_url.decode('ascii', 'ignore')] = match.group(1).decode('ascii', 'ignore').replace('js_', 'im_')
 						return orig_url
 					data = re.sub(b'''(?:(?:https?:)?//web.archive.org)?/web/([^/]+)/([^"\\'#<>]+)''', add_to_date_cache, data)
 			elif mode == 1: # oocities
@@ -401,22 +531,16 @@ class Handler(socketserver.BaseRequestHandler):
 	def send_passthrough(self, conn, http_version, content_type, request_url):
 		"""Pass data through to the client unmodified (save for our headers)."""
 		self.send_response_headers(conn, http_version, content_type, request_url, content_length=True)
-		while True:
-			data = conn.read(1024)
-			if not data:
-				break
+		for data in conn.stream(1024):
 			self.request.sendall(data)
+		conn.release_conn()
 		self.request.close()
 
 	def send_response_headers(self, conn, http_version, content_type, request_url, content_length=False):
 		"""Generate and send the response headers."""
 
 		# Pass the HTTP version, and error code if there is one.
-		response = http_version
-		if isinstance(conn, urllib.error.HTTPError):
-			response += ' {0} {1}'.format(conn.code, conn.reason.replace('\n', ' '))
-		else:
-			response += ' 200 OK'
+		response = '{0} {1} {2}'.format(http_version, conn.status, conn.reason.replace('\n', ' '))
 
 		# Add Content-Type, Content-Length and the caching ETag.
 		response += '\r\nContent-Type: ' + content_type
@@ -424,6 +548,7 @@ class Handler(socketserver.BaseRequestHandler):
 			response += '\r\nContent-Length: ' + str(content_length)
 			content_length = False # don't pass the original length through
 		response += '\r\nETag: "' + request_url.replace('"', '') + '"'
+		response += '\r\nConnection: close' # helps with IE6 trying to use proxy keep alive and holding half-open connections
 
 		# Pass X-Archive-Orig-* (and Content-Length if requested) headers through.
 		for header in conn.headers:
@@ -438,8 +563,8 @@ class Handler(socketserver.BaseRequestHandler):
 		# Finish and send the request.
 		response += '\r\n\r\n'
 		self.request.sendall(response.encode('utf8', 'ignore'))
-	
-	def send_error_page(self, http_version, code, reason):
+
+	def send_error_page(self, http_version, code, reason, extra=''):
 		"""Generate an error page."""
 
 		# Get a description for this error code.
@@ -448,30 +573,29 @@ class Handler(socketserver.BaseRequestHandler):
 		elif code == 403: # not crawled due to exclusion
 			description = 'This page was not archived due to a Wayback Machine exclusion.'
 		elif code == 501: # method not implemented
-			description = 'WaybackProxy only implements the GET method.'
+			description = 'WaybackProxy only implements the GET method. Your browser sent a request with the {0} method.'.format(extra.upper())
 		elif code == 502: # exception
 			description = 'This page could not be fetched due to an unknown error.'
 		elif code == 504: # timeout
-			description = 'This page could not be fetched due to a Wayback Machine server timeout.'
+			description = 'This page could not be fetched due to a Wayback Machine server error.'
 		elif code == 412: # outside of tolerance
 			description = 'The earliest snapshot for this page is outside of the configured tolerance interval.'
 		elif code == 400 and reason == 'Host header missing': # no host header in transparent mode
-			description = 'WaybackProxy\'s transparent mode requires an HTTP/1.1 compliant client.'
+			description = 'WaybackProxy\'s transparent mode requires an HTTP/1.1-compliant client.'
 		else: # another error
 			description = 'Unknown error. The Wayback Machine may be experiencing technical difficulties.'
-		
+
 		# Read error page file.
 		try:
-			f = open('error.html', 'r', encoding='utf8', errors='ignore')
-			error_page = f.read()
-			f.close()
+			with open('error.html', 'r', encoding='utf8', errors='ignore') as f:
+				error_page = f.read()
 		except:
 			# Just send the code and reason as a backup.
 			error_page = '${code} ${reason}'
 
 		# Format error page template.
 		signature = self.signature()
-		error_page = string.Template(error_page).substitute(**locals())
+		error_page = string.Template(error_page).substitute(**locals()).encode('utf8', 'ignore')
 		error_page_len = len(error_page)
 
 		# Send formatted error page and stop.
@@ -480,25 +604,50 @@ class Handler(socketserver.BaseRequestHandler):
 			'Content-Type: text/html\r\n'
 			'Content-Length: {error_page_len}\r\n'
 			'\r\n'
-			'{error_page}'
 			.format(**locals()).encode('utf8', 'ignore')
 		)
+		self.request.sendall(error_page)
 		self.request.close()
 
 	def send_redirect_page(self, http_version, target, code=302):
 		"""Generate a redirect page."""
 
-		# make redirect page
-		redirectpage  = '<html><head><title>Redirect</title><meta http-equiv="refresh" content="0;url='
-		redirectpage += target
-		redirectpage += '"></head><body><p>If you are not redirected, <a href="'
-		redirectpage += target
-		redirectpage += '">click here</a>.</p></body></html>'
+		# Make redirect page.
+		redirect_page = '<html><head><title>Redirect</title><meta http-equiv="refresh" content="0;url=${target}"></head><body><p>If you are not redirected, <a href="${target}">click here</a>.</p></body></html>'
+		redirect_page = string.Template(redirect_page).substitute(**locals()).encode('utf8', 'ignore')
+		redirect_page_len = len(redirect_page)
 
-		# send redirect page and stop
-		self.request.sendall('{0} {1} Found\r\nLocation: {2}\r\nContent-Type: text/html\r\nContent-Length: {3}\r\n\r\n{4}'.format(http_version, code, target, len(redirectpage), redirectpage).encode('utf8', 'ignore'))
+		# Send redirect page and stop.
+		self.request.sendall(
+			'{http_version} {code} Found\r\n'
+			'Location: {target}\r\n'
+			'Content-Type: text/html\r\n'
+			'Content-Length: {redirect_page_len}\r\n'
+			'\r\n'
+			.format(**locals()).encode('utf8', 'ignore')
+		)
+		self.request.sendall(redirect_page)
 		self.request.close()
-	
+
+	def guess_and_send_redirect(self, http_version, guess_url):
+		# Heuristically determine the static URL for some redirect scripts.
+		parsed = urllib.parse.urlparse(guess_url)
+		match = re.search('''(?:^|&)[^=]+=((?:https?(?:%3A|:)(?:%2F|/)|www[0-9]*\\.[^/%]+)?(?:%2F|/)[^&]+)''', parsed.query, re.I) # URL in query parameters
+		if not match:
+			full_path = parsed.path
+			if parsed.query:
+				full_path += '?' + parsed.query
+			match = re.search('''((?:https?(?:%3A|:)(?:%2F|/)|www[0-9]*\\.[^/%]+)(?:(?:%2F|/).+|$))''', full_path, re.I) # URL in path or full query
+		if match: # found URL
+			# Decode and sanitize the URL.
+			new_url = self.sanitize_redirect(urllib.parse.unquote_plus(match.group(1)))
+
+			# Redirect client to the URL.
+			_print('[r] [g]', new_url)
+			self.send_redirect_page(http_version, new_url)
+			return True
+		return False
+
 	def handle_settings(self, query):
 		"""Generate the settings page."""
 
@@ -517,7 +666,7 @@ class Handler(socketserver.BaseRequestHandler):
 				GEOCITIES_FIX = 'gcFix' in parsed
 				QUICK_IMAGES = 'quickImages' in parsed
 				CONTENT_TYPE_ENCODING = 'ctEncoding' in parsed
-		
+
 		# send the page and stop
 		settingspage  = 'HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n'
 		settingspage += '<html><head><title>WaybackProxy Settings</title></head><body><p><b>'
@@ -558,10 +707,18 @@ class Handler(socketserver.BaseRequestHandler):
 
 	def wayback_to_datetime(self, date):
 		"""Convert a Wayback format date string to a datetime.datetime object."""
-		try:
-			return datetime.datetime.strptime(str(date)[:14], '%Y%m%d%H%M%S')
-		except:
-			return datetime.datetime.strptime(str(date)[:8], '%Y%m%d')
+		date = str(date)
+		fmt = '%Y%m%d%H%M%S'
+		fmt_len = 14
+		while fmt:
+			try:
+				return datetime.datetime.strptime(date[:fmt_len], fmt)
+			except:
+				fmt = fmt[:-2]
+				fmt_len -= 2
+
+	def drain_conn(self, conn):
+		getattr(conn, 'drain_conn', conn.read)()
 
 print_lock = threading.Lock()
 def _print(*args, **kwargs):
